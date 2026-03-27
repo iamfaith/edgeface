@@ -1,7 +1,7 @@
 import torch
-from torchvision import transforms
-from face_alignment import align
-from backbones import get_model
+
+
+
 
 import os
 import cv2
@@ -10,6 +10,56 @@ import onnxruntime as ort
 from PIL import Image
 
 face_cascade = cv2.CascadeClassifier("haarcascade_frontalface_default.xml")
+
+
+# backend: auto|onnx|pt
+backend = os.environ.get("EDGEFACE_BACKEND", "auto").lower()
+
+# load model
+model_name = "edgeface_s_gamma_05"  # or edgeface_xs_gamma_06
+checkpoint_path = f'/home/faith/edgeface/checkpoints/{model_name}.pt'
+onnx_path = f'/home/faith/edgeface/{model_name}.onnx'
+
+model = None
+ort_session = None
+
+
+def _load_backend():
+    global model, ort_session, backend
+
+    if backend in ("auto", "onnx") and os.path.isfile(onnx_path):
+        providers = ["CPUExecutionProvider"]
+        if "CUDAExecutionProvider" in ort.get_available_providers():
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        ort_session = ort.InferenceSession(onnx_path, providers=providers)
+        backend = "onnx"
+        return
+
+    if backend in ("auto", "pt"):
+        from backbones import get_model
+        model_pt = get_model(model_name)
+        model_pt.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
+        model_pt.eval()
+        model = model_pt
+        backend = "pt"
+        return
+
+    raise RuntimeError(f"Unsupported backend: {backend}")
+
+
+def _infer(chnw_input):
+    if backend == "onnx":
+        input_name = ort_session.get_inputs()[0].name
+        output = ort_session.run(None, {input_name: chnw_input.astype(np.float32)})[0]
+        return np.asarray(output).squeeze(0)
+
+    input_tensor = torch.from_numpy(chnw_input).float()
+    with torch.no_grad():
+        output = model(input_tensor)
+    return output.squeeze(0).cpu().numpy()
+
+
+_load_backend()
 
 def detect_and_preprocess(img_path, target_size=(112, 112)):
     img = cv2.imread(img_path)
@@ -34,46 +84,32 @@ def detect_and_preprocess(img_path, target_size=(112, 112)):
     
     face_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
     face_resized = cv2.resize(face_rgb, target_size)
-    face_norm = (face_resized.astype(np.float32) - 127.5) / 128.0
+    face_norm = (face_resized.astype(np.float32) - 127.5) / 127.5
     face = np.expand_dims(face_norm, axis=0)  # shape: (1, 112, 112, 3)
     return face.transpose(0, 3, 1, 2)  # shape: (1, 3, 112, 112)
 
 
-# load model
-model_name="edgeface_s_gamma_05" # or edgeface_xs_gamma_06
-model=get_model(model_name)
-checkpoint_path=f'/home/faith/edgeface/checkpoints/{model_name}.pt'
-model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
-model.eval()
 
-transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-            ])
 
 
 def get_embed(path):
     transformed_input = detect_and_preprocess(path)
-    transformed_input = torch.from_numpy(transformed_input).float()
-    
-    with torch.no_grad():
-        # print(transformed_input.shape)
-        embedding = model(transformed_input)
-    return embedding.squeeze(0).cpu().numpy()
+    return _infer(transformed_input)
 
 
 def get_embedding(path):
     # path = 'path_to_face_image'
+    from face_alignment import align
     aligned = align.get_aligned_face(path) # align face
     if aligned is None:
         raise RuntimeError(f"Failed to align face for: {path}")
-    transformed_input = transform(aligned).unsqueeze(0) # preprocessing
-
-    # extract embedding
-    with torch.no_grad():
-        print(transformed_input.shape)
-        embedding = model(transformed_input)
-    return embedding.squeeze(0).cpu().numpy()
+    from torchvision import transforms
+    transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ])
+    transformed_input = transform(aligned).unsqueeze(0).cpu().numpy().astype(np.float32) # preprocessing
+    return _infer(transformed_input)
 
 
 def cosine_similarity(embedding1, embedding2):
@@ -85,10 +121,10 @@ def cosine_similarity(embedding1, embedding2):
 
 
 if __name__ == "__main__":
-    img1_path = '/home/faith/edgeface/didi.jpg'  # replace with your image path
+    img1_path = '/home/faith/edgeface/young.jpg'  # replace with your image path
     # emb1 = get_embedding(img1_path)
 
-    img2_path = '/home/faith/edgeface/me.jpg'  # replace with your image path
+    img2_path = '/home/faith/edgeface/白底.jpg'  # replace with your image path
     # emb2 = get_embedding(img2_path)
     # print(emb1)
     # print(emb2)
@@ -97,5 +133,6 @@ if __name__ == "__main__":
     emb2 = get_embed(img2_path)
 
     cosine_sim = cosine_similarity(emb1, emb2)
+    print(f"Backend: {backend}")
     print(f"Embedding norms: {np.linalg.norm(emb1):.6f}, {np.linalg.norm(emb2):.6f}")
     print(f"Cosine similarity between '{os.path.basename(img1_path)}' and '{os.path.basename(img2_path)}': {cosine_sim:.6f}")
